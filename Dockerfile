@@ -1,6 +1,5 @@
 # Dockerfile para FastAPI + Tesseract OCR + S3
-
-FROM python:3.10-slim
+FROM public.ecr.aws/docker/library/python:3.10-slim
 
 # Directorio de trabajo
 WORKDIR /app
@@ -23,4 +22,4 @@ COPY . .
 EXPOSE 8000
 
 # Comando por defecto para desarrollar
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
