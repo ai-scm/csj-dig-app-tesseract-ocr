@@ -5,6 +5,7 @@ import time
 from typing import List
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pdf2image import convert_from_path
 import pytesseract
@@ -22,6 +23,10 @@ class S3OCRRequest(BaseModel):
     pdf_key: str
     output_txt_key: str
 
+
+@app.get("/health", status_code=200)
+def health_check():
+    return JSONResponse(content={"status": "ok"}, status_code=200)
 
 @app.get("/")
 async def root():
