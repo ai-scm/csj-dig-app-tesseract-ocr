@@ -1,0 +1,5 @@
+{
+  "bucket": "csj-dig-test-ocr-tesseract",
+  "pdf_key": "pdf/00-05898 T001.pdf",
+  "output_txt_key": "outputs/test_ec2.txt"
+}

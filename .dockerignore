@@ -1,0 +1,18 @@
+# Ignorar entornos y caches
+venv/
+__pycache__/
+*.pyc
+
+# Variables de entorno sensibles
+.env
+.env.template
+
+# Configuración y ejemplos locales
+.git/
+.gitignore
+README.md
+request.json
+
+
+# Docker y sistemas
+Dockerfile
