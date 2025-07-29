@@ -1,85 +1,176 @@
-# Configuración y uso en Linux
+# 🚀 API OCR Masivo CSJ - AWS Cloud
 
-Este proyecto expone un servicio REST en FastAPI para aplicar OCR con Tesseract a PDFs almacenados en S3, convirtiéndolos a texto plano y subiéndolos de vuelta a S3.
+API FastAPI para procesamiento masivo de PDFs con OCR Tesseract optimizado, desplegada en **AWS ECS/Fargate** para máximo rendimiento.
 
-## Requisitos previos
+## ✨ Características V5.0.0
 
-* Ubuntu (20.04 o superior)
-* Python 3.8+
-* `poppler-utils` (para convertir PDF a imágenes)
-* `tesseract-ocr` (motor OCR)
+- 🌩️ **100% Cloud** - Optimizado para AWS ECS/Fargate
+- ⚡ **3 Funciones principales** para diferentes casos de uso
+- 🎯 **Auto-extracción** de folder_id desde rutas de archivos
+- 📊 **Estructura optimizada CSJ**: `processing/{folder_id}/resources/split_text/`
+- 🔍 **Detección automática** de tipos de documento jurídico
+- 💾 **Gestión inteligente** de memoria para PDFs grandes
+- � **Fallback PyPDF2** si falla pdf2image/Tesseract
 
-## Instalación de dependencias del sistema
+## 🎯 URL de Producción
 
-Abre una terminal y ejecuta:
+```
+https://csj-prod-tesseract.ia.ramajudicial.consultadocumental.nuvu.cc
+```
 
+### 📖 Documentación Interactiva
+- **Swagger UI**: https://csj-prod-tesseract.ia.ramajudicial.consultadocumental.nuvu.cc/docs
+- **ReDoc**: https://csj-prod-tesseract.ia.ramajudicial.consultadocumental.nuvu.cc/redoc
+- **Health Check**: https://csj-prod-tesseract.ia.ramajudicial.consultadocumental.nuvu.cc/health
+
+## 🎯 Las 3 Funciones Principales
+
+### 1️⃣ **Función 1: Procesar PDF Individual**
+**Endpoint**: `POST /ocr/process-pdf`
+
+Para procesar un PDF específico:
+
+```json
+{
+  "bucket": "csj-prod-digitalizacion-datalake",
+  "pdf_key": "digitalizaciones_blend/2008-00151/2008-00151 T010.pdf", 
+  "folder_id": "2008-00151"
+}
+```
+
+**Resultado**: 
+- Archivo guardado en: `s3://bucket/processing/2008-00151/resources/split_text/2008-00151 T010.txt`
+
+### 2️⃣ **Función 2: Procesar Lista Masiva**
+**Endpoint**: `POST /ocr/process-multiple`  
+
+Para procesar múltiples PDFs de diferentes carpetas:
+
+```json
+{
+  "bucket": "csj-prod-digitalizacion-datalake",
+  "pdf_list": [
+    "digitalizaciones_csj/11001310300320020009101/archivo1.pdf",
+    "digitalizaciones_csj/11001310300420030015700/archivo2.pdf", 
+    "digitalizaciones_blend/2008-00151/2008-00151 T010.pdf"
+  ]
+}
+```
+
+**Resultado**:
+- Cada PDF se guarda automáticamente en su carpeta correspondiente
+- Procesamiento paralelo optimizado 
+
+### 3️⃣ **Función 3: Procesar Carpeta Completa**
+**Endpoint**: `POST /ocr/process-folder`
+
+Para procesar todos los PDFs de una carpeta:
+
+```json
+{
+  "bucket": "csj-prod-digitalizacion-datalake",
+  "folder_prefix": "digitalizaciones_blend/2008-00151/"
+}
+```
+
+**Resultado**:
+- Procesa automáticamente todos los PDFs encontrados en la carpeta
+
+## 📊 Endpoint de Estadísticas
+
+**Endpoint**: `GET /ocr/stats/{bucket}/{prefix}`
+
+Ejemplo: 
+```
+GET /ocr/stats/csj-prod-digitalizacion-datalake/processing/2008-00151/
+```
+
+Muestra estadísticas de archivos procesados vs pendientes.
+
+## 🧪 Scripts de Prueba
+
+### Prueba Individual (Archivo de ejemplo ya subido)
+```python
+# test_api.py
+/home/lenovo/Escritorio/Repos/OCR/.venv/bin/python test_api.py
+```
+
+### Procesamiento Masivo (Tu lista de 224+ PDFs)
+```python  
+# procesamiento_masivo.py
+/home/lenovo/Escritorio/Repos/OCR/.venv/bin/python procesamiento_masivo.py
+```
+
+## 🔄 Proceso de Deploy
+
+### Cuando hagas cambios al código:
+
+1. **Hacer commit y push**:
 ```bash
-sudo apt update
-sudo apt install -y python3-venv python3-pip poppler-utils tesseract-ocr
+git add .
+git commit -m "Actualización OCR v5.0.0 - Optimizado para AWS"
+git push origin main
 ```
 
-## Entorno Python
+2. **Rebuild automático**: 
+   - AWS CodePipeline detecta el push
+   - Construye nueva imagen Docker automáticamente 
+   - Redeploy en ECS/Fargate
+   - **Tiempo estimado**: 5-10 minutos
 
-1. Crea y activa un entorno virtual:
-
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-
-2. Instala las dependencias Python:
-
-   ```bash
-   pip install --upgrade pip
-   pip install fastapi uvicorn pdf2image pytesseract boto3 python-dotenv pillow
-   ```
-
-## Variables de entorno
-
-1. Copia la plantilla y configura tus credenciales AWS:
-
-   ```bash
-   cp .env.template .env
-   ```
-
-2. Abre `.env` y completa los valores:
-
-   ```ini
-   AWS_ACCESS_KEY_ID=
-   AWS_SECRET_ACCESS_KEY=
-   AWS_SESSION_TOKEN=
-   AWS_REGION=us-east-1
-   ```
-
-## Archivos de ejemplo
-
-* **`.env.template`**: plantilla con las variables necesarias.
-* **`request.json`**: ejemplo de body para la petición HTTP:
-
-  ```json
-  {
-    "bucket": "nombre-del-bucket",
-    "pdf_key": "ruta/al/pdf.pdf",
-    "output_txt_key": "ruta/de/output.txt"
-  }
-  ```
-
-## Ejecutar la API
-
-Con el entorno activo y las variables cargadas:
-
+3. **Verificar deploy**:
 ```bash
-uvicorn main:app --reload
+curl https://csj-prod-tesseract.ia.ramajudicial.consultadocumental.nuvu.cc/health
 ```
 
-El servicio quedará disponible en `http://localhost:8000`.
+## 📈 Rendimiento Esperado en AWS
 
-## Probar el endpoint con Swagger UI integrada
+- **PDF pequeño** (1-10 páginas): 15-30 segundos ⚡
+- **PDF mediano** (50-100 páginas): 2-5 minutos ⚡  
+- **PDF grande** (200+ páginas): 5-12 minutos ⚡
+- **Lote masivo 224 PDFs**: 2-4 horas ⚡ (vs 6+ horas local)
 
-FastAPI incluye documentación interactiva en:
+## 🗂️ Estructura de Archivos S3
 
 ```
-http://localhost:8000/docs
+s3://csj-prod-digitalizacion-datalake/
+├── digitalizaciones_csj/
+│   └── {numero_caso}/
+│       └── archivo_original.pdf
+├── digitalizaciones_blend/
+│   └── {folder_id}/
+│       └── archivo_original.pdf  
+└── processing/
+    └── {folder_id}/
+        └── resources/
+            └── split_text/
+                └── archivo_procesado.txt
 ```
 
-Ahí podrás ver el endpoint `/ocr/pdf-to-text-s3`, completar el JSON de ejemplo y ejecutarlo directamente desde la interfaz web.
+## 🔐 Configuración AWS
+
+La aplicación usa **IAM Role** automáticamente en ECS. No requiere credenciales hardcoded.
+
+**Permisos requeridos**:
+- `s3:GetObject` (leer PDFs)
+- `s3:PutObject` (escribir TXTs) 
+- `s3:ListBucket` (listar carpetas)
+
+## 🚀 Casos de Uso
+
+### ✅ Para 1 PDF específico:
+Usar **Función 1** desde Swagger UI
+
+### ✅ Para lista masiva (tu caso de 224 PDFs):
+1. Editar `procesamiento_masivo.py`
+2. Agregar tu lista completa en `LISTA_MASIVA_PDFS` 
+3. Ejecutar el script
+
+### ✅ Para carpeta completa:
+Usar **Función 3** con el `folder_prefix`
+
+## 🎉 ¡Todo listo para producción!
+
+La API está optimizada para trabajar 100% en la nube AWS con el poder de procesamiento de ECS/Fargate. 
+
+**¿Siguiente paso?** ¡Probar con el PDF que mencionas y luego escalar al procesamiento masivo! 🚀
