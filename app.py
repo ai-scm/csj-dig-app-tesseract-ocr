@@ -3,9 +3,12 @@ import tempfile
 import gc
 import re
 import uvicorn
+import uuid
+import asyncio
 from typing import List
+from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pdf2image import convert_from_path
@@ -27,6 +30,16 @@ s3_client = boto3.client(
     aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
 )
+
+# Crear pool de hilos para procesamiento de PDFs
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # Ajusta según tu CPU
+thread_pool = ThreadPoolExecutor(
+    max_workers=MAX_WORKERS,
+    thread_name_prefix="pdf_processor"
+)
+
+
+async_tasks = {}
 
 app = FastAPI(
     title="OCR Masivo CSJ - AWS Cloud",
@@ -245,6 +258,12 @@ class ProcessPDFRequest(BaseModel):
     pdf_key: str
     folder_id: str
 
+
+class ProcessPDFRequestAsync(BaseModel):
+    bucket: str
+    pdf_key: str
+    output_key: str = None
+
 class ProcessMultiplePDFsRequest(BaseModel):
     bucket: str
     pdf_list: List[str]
@@ -261,8 +280,10 @@ async def root():
         "descripcion": "Procesamiento masivo optimizado de PDFs a texto en AWS ECS",
         "endpoints": {
             "process_single_pdf": "/ocr/process-pdf",
+            "process_single_pdf_async": "/ocr/process-pdf-async",
             "process_multiple_pdfs": "/ocr/process-multiple",
             "process_folder": "/ocr/process-folder",
+            "async_state": "/ocr/async-state/{task_id}",
             "stats": "/ocr/stats/{bucket}/{prefix:path}"
         }
     }
@@ -346,6 +367,156 @@ async def process_single_pdf(req: ProcessPDFRequest):
             
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error procesando PDF: {e}")
+
+@app.post("/ocr/process-pdf-async")
+async def process_single_pdf_async(req: ProcessPDFRequestAsync, background_tasks: BackgroundTasks):
+    """Procesa un PDF individual generando un archivo de texto optimizado en segundo plano"""
+    
+    # Verificar que el archivo existe en S3 antes de procesar
+    try:
+        s3_client.head_object(Bucket=req.bucket, Key=req.pdf_key)
+        print(f"✅ Archivo encontrado en S3: {req.pdf_key}")
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            raise HTTPException(status_code=404, detail=f"Archivo no encontrado en S3: {req.pdf_key}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Error verificando archivo en S3: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error inesperado verificando archivo: {str(e)}")
+    
+    # Generar UUID único para seguimiento
+    task_id = str(uuid.uuid4())
+    
+    # Inicializar estado en async_tasks
+    async_tasks[task_id] = {
+        "state": "In Progress",
+        "progress": "0/0"
+    }
+    
+    def process_pdf_background():
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_pdf = os.path.join(tmpdir, "input.pdf")
+                
+                try:
+                    print(f"🔄 Descargando PDF: {req.pdf_key}")
+                    s3_client.download_file(req.bucket, req.pdf_key, local_pdf)
+                    print(f"✅ PDF descargado exitosamente")
+                except Exception as e:
+                    async_tasks[task_id] = {
+                        "state": "Error",
+                        "progress": "0/0",
+                        "error": str(e)
+                    }
+                    return
+
+                try:
+                    # Obtener número de páginas
+                    pdf = PdfReader(local_pdf)
+                    total_pages = len(pdf.pages)
+                    print(f"📄 PDF tiene {total_pages} páginas")
+                    
+                    # Actualizar progreso inicial
+                    async_tasks[task_id]["progress"] = f"0/{total_pages}"
+                    
+                    # Procesar todas las páginas
+                    all_pages_text = []
+                    for page_num in range(total_pages):
+                        try:
+                            page_text = process_single_page(local_pdf, page_num)
+                            if page_text and page_text.strip():
+                                all_pages_text.append(page_text)
+                            
+                            # Actualizar progreso
+                            async_tasks[task_id]["progress"] = f"{page_num + 1}/{total_pages}"
+                            
+                            # Progreso cada 10 páginas
+                            if (page_num + 1) % 10 == 0:
+                                print(f"✅ Procesadas {page_num + 1}/{total_pages} páginas")
+                            
+                            # Limpiar memoria periódicamente
+                            gc.collect()
+                        except Exception as e:
+                            print(f"Error en página {page_num + 1}: {e}")
+                            continue
+                    
+                    if not all_pages_text:
+                        async_tasks[task_id] = {
+                            "state": "Error",
+                            "progress": f"{total_pages}/{total_pages}",
+                            "error": "No se pudo extraer texto del PDF"
+                        }
+                        return
+                    
+                    # Combinar todo el texto SIN separadores de página
+                    document_text = combine_pages_text(all_pages_text)
+                    
+                    # Detectar tipo de documento
+                    doc_type = detect_document_type(document_text)
+                    
+                    # Crear archivo de texto con el mismo nombre que el PDF original
+                    original_filename = os.path.basename(req.pdf_key)
+                    filename = original_filename.replace('.pdf', '.txt').replace('.PDF', '.txt')
+                    local_txt = os.path.join(tmpdir, filename)
+                    
+                    # Escribir contenido
+                    with open(local_txt, "w", encoding="utf-8") as f:
+                        f.write(document_text)
+                    
+                    # Subir a S3 en la estructura correcta
+                    s3_key = f"{req.output_key}/{filename}"
+                    s3_client.upload_file(local_txt, req.bucket, s3_key)
+                    
+                    print(f"✅ Archivo subido: {s3_key}")
+                    
+                    # Marcar como completado exitosamente
+                    async_tasks[task_id] = {
+                        "state": "OK",
+                        "progress": f"{total_pages}/{total_pages}",
+                        "filename": filename,
+                        "s3_key": s3_key,
+                        "pages_processed": len(all_pages_text),
+                        "document_type": doc_type
+                    }
+                    
+                except Exception as e:
+                    async_tasks[task_id] = {
+                        "state": "Error",
+                        "progress": "0/0",
+                        "error": str(e)
+                    }
+                    
+        except Exception as e:
+            async_tasks[task_id] = {
+                "state": "Error",
+                "progress": "0/0",
+                "error": str(e)
+            }
+    
+    loop = asyncio.get_event_loop()
+    
+    loop.run_in_executor(thread_pool, process_pdf_background)
+    
+    return {
+        "message": "PDF enviado para procesamiento en segundo plano",
+        "task_id": task_id,
+        "state": "In Progress"
+    }
+
+@app.get("/ocr/async-state/{task_id}")
+async def get_async_task_state(task_id: str):
+    """Obtiene el estado de una tarea asíncrona por su UUID"""
+    
+    if task_id not in async_tasks:
+        raise HTTPException(status_code=404, detail="Tarea no encontrada")
+    
+    task_info = async_tasks[task_id]
+    
+    if task_info["state"].upper() in ["OK", "ERROR"]:
+        task_result = async_tasks.pop(task_id)
+        return task_result
+        
+    return task_info
 
 @app.post("/ocr/process-multiple")
 async def process_multiple_pdfs(req: ProcessMultiplePDFsRequest):
@@ -467,4 +638,10 @@ async def get_folder_stats(bucket: str, prefix: str):
         )
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    finally:
+        # Limpiar el pool de hilos al cerrar
+        print("🔄 Cerrando ThreadPool...")
+        thread_pool.shutdown(wait=True)
+        print("✅ ThreadPool cerrado correctamente")
