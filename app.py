@@ -14,13 +14,15 @@ from pydantic import BaseModel
 from pdf2image import convert_from_path
 import pytesseract
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import ImageEnhance, ImageFilter
 
 # Cargar variables de entorno
 load_dotenv()
+
+os.environ["TESSDATA_PREFIX"]="/etc/tessdata"
 
 # Configurar AWS S3 - Optimizado para AWS ECS/Fargate con IAM Role
 s3_client = boto3.client(
@@ -42,14 +44,14 @@ thread_pool = ThreadPoolExecutor(
 async_tasks = {}
 
 app = FastAPI(
-    title="OCR Masivo CSJ - AWS Cloud",
+    title="OCR Masivo - AWS Cloud",
     description="API para procesamiento masivo de PDFs con OCR optimizado - Versión AWS ECS",
     version="5.0.0"
 )
 
 def get_optimal_config():
     """Configuración optimizada de Tesseract"""
-    return r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ÁÉÍÓÚáéíóúÑñÜü.,;:!?()[]{}"-/\% '
+    return r"""--oem 3 --psm 6 -c tessedit_char_whitelist='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ÁÉÍÓÚáéíóúÑñÜü.,;:!?()[]{}"-/\% '"""
 
 def enhance_image_quality(image):
     """Mejora la calidad de imagen para OCR"""
@@ -71,7 +73,7 @@ def enhance_image_quality(image):
         
         return image
     except Exception as e:
-        print(f"Error mejorando imagen: {e}")
+        print(f"Error mejorando imagen: {repr(e)}")
         return image
 
 def detect_document_type(text: str) -> str:
@@ -111,12 +113,12 @@ def process_single_page(pdf_path: str, page_num: int) -> str:
                 enhanced_img = enhance_image_quality(img)
                 
                 # Extraer texto con configuración optimizada
-                page_text = pytesseract.image_to_string(enhanced_img, config=config)
+                page_text = pytesseract.image_to_string(enhanced_img, lang="spa", config=config)
                 text = page_text
                 print(f"✅ OCR exitoso en página {page_num + 1}")
                 
             except Exception as e:
-                print(f"⚠️ Error en OCR página {page_num + 1}: {e}")
+                print(f"⚠️ Error en OCR página {page_num + 1}: {repr(e)}")
                 text = ""
             
             img.close()
@@ -254,23 +256,28 @@ def extract_folder_id_from_pdf_name(pdf_key: str) -> str:
 
 # Modelos Pydantic
 class ProcessPDFRequest(BaseModel):
-    bucket: str
-    pdf_key: str
-    folder_id: str
-
+    source_bucket: str
+    source_pdf_key: str
+    dest_bucket: str
+    dest_key: str
 
 class ProcessPDFRequestAsync(BaseModel):
-    bucket: str
-    pdf_key: str
-    output_key: str = None
+    source_bucket: str
+    source_pdf_key: str
+    dest_bucket: str
+    dest_prefix: str
 
 class ProcessMultiplePDFsRequest(BaseModel):
-    bucket: str
-    pdf_list: List[str]
+    source_bucket: str
+    pdf_key_list: List[str]
+    dest_bucket: str
+    dest_prefix: str
 
 class ProcessFolderRequest(BaseModel):
     bucket: str
     folder_prefix: str
+    dest_bucket: str
+    dest_prefix: str
 
 @app.get("/")
 async def root():
@@ -300,11 +307,13 @@ async def process_single_pdf(req: ProcessPDFRequest):
         local_pdf = os.path.join(tmpdir, "input.pdf")
         
         try:
-            print(f"🔄 Descargando PDF: {req.pdf_key}")
-            s3_client.download_file(req.bucket, req.pdf_key, local_pdf)
+            print(f"🔄 Descargando PDF: {req.source_pdf_key}")
+            s3_client.download_file(req.source_bucket, req.source_pdf_key, local_pdf)
             print(f"✅ PDF descargado exitosamente")
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error descargando PDF: {e}")
+            msg = f"Error descargando PDF: {repr(e)}"
+            print(msg)
+            raise HTTPException(status_code=400, detail=msg)
 
         try:
             # Obtener número de páginas
@@ -340,7 +349,7 @@ async def process_single_pdf(req: ProcessPDFRequest):
             doc_type = detect_document_type(document_text)
             
             # Crear archivo de texto con el mismo nombre que el PDF original
-            original_filename = os.path.basename(req.pdf_key)
+            original_filename = os.path.basename(req.source_pdf_key)
             filename = original_filename.replace('.pdf', '.txt').replace('.PDF', '.txt')
             local_txt = os.path.join(tmpdir, filename)
             
@@ -349,17 +358,17 @@ async def process_single_pdf(req: ProcessPDFRequest):
                 f.write(document_text)
             
             # Subir a S3 en la estructura correcta: processing/{folder_id}/resources/split_text/
-            s3_key = f"processing/{req.folder_id}/resources/split_text/{filename}"
-            s3_client.upload_file(local_txt, req.bucket, s3_key)
+            s3_key = req.dest_key
+            s3_client.upload_file(local_txt, req.source_bucket, s3_key)
             
             print(f"✅ Archivo subido: {s3_key}")
             
             return {
                 "status": "success",
                 "message": "PDF procesado exitosamente",
-                "folder_id": req.folder_id,
+                "destination_bucket": req.dest_bucket,
+                "destination_key": req.dest_key,
                 "total_pages": total_pages,
-                "filename": filename,
                 "s3_key": s3_key,
                 "pages_processed": len(all_pages_text),
                 "document_type": doc_type
@@ -374,11 +383,11 @@ async def process_single_pdf_async(req: ProcessPDFRequestAsync, background_tasks
     
     # Verificar que el archivo existe en S3 antes de procesar
     try:
-        s3_client.head_object(Bucket=req.bucket, Key=req.pdf_key)
-        print(f"✅ Archivo encontrado en S3: {req.pdf_key}")
+        s3_client.head_object(Bucket=req.source_bucket, Key=req.source_pdf_key)
+        print(f"✅ Archivo encontrado en S3: {req.source_pdf_key}")
     except ClientError as e:
         if e.response['Error']['Code'] == '404':
-            raise HTTPException(status_code=404, detail=f"Archivo no encontrado en S3: {req.pdf_key}")
+            raise HTTPException(status_code=404, detail=f"Archivo no encontrado en S3: {req.source_pdf_key}")
         else:
             raise HTTPException(status_code=500, detail=f"Error verificando archivo en S3: {str(e)}")
     except Exception as e:
@@ -399,8 +408,8 @@ async def process_single_pdf_async(req: ProcessPDFRequestAsync, background_tasks
                 local_pdf = os.path.join(tmpdir, "input.pdf")
                 
                 try:
-                    print(f"🔄 Descargando PDF: {req.pdf_key}")
-                    s3_client.download_file(req.bucket, req.pdf_key, local_pdf)
+                    print(f"🔄 Descargando PDF: {req.source_pdf_key}")
+                    s3_client.download_file(req.source_bucket, req.source_pdf_key, local_pdf)
                     print(f"✅ PDF descargado exitosamente")
                 except Exception as e:
                     async_tasks[task_id] = {
@@ -437,7 +446,7 @@ async def process_single_pdf_async(req: ProcessPDFRequestAsync, background_tasks
                             # Limpiar memoria periódicamente
                             gc.collect()
                         except Exception as e:
-                            print(f"Error en página {page_num + 1}: {e}")
+                            print(f"Error en página {page_num + 1}: {repr(e)}")
                             continue
                     
                     if not all_pages_text:
@@ -455,7 +464,7 @@ async def process_single_pdf_async(req: ProcessPDFRequestAsync, background_tasks
                     doc_type = detect_document_type(document_text)
                     
                     # Crear archivo de texto con el mismo nombre que el PDF original
-                    original_filename = os.path.basename(req.pdf_key)
+                    original_filename = os.path.basename(req.source_pdf_key)
                     filename = original_filename.replace('.pdf', '.txt').replace('.PDF', '.txt')
                     local_txt = os.path.join(tmpdir, filename)
                     
@@ -464,8 +473,8 @@ async def process_single_pdf_async(req: ProcessPDFRequestAsync, background_tasks
                         f.write(document_text)
                     
                     # Subir a S3 en la estructura correcta
-                    s3_key = f"{req.output_key}/{filename}"
-                    s3_client.upload_file(local_txt, req.bucket, s3_key)
+                    s3_key = f"{req.dest_prefix}/{filename}"
+                    s3_client.upload_file(local_txt, req.source_bucket, s3_key)
                     
                     print(f"✅ Archivo subido: {s3_key}")
                     
@@ -523,21 +532,24 @@ async def process_multiple_pdfs(req: ProcessMultiplePDFsRequest):
     """Procesa múltiples PDFs de una lista específica"""
     
     results = []
-    total_pdfs = len(req.pdf_list)
+    total_pdfs = len(req.pdf_key_list)
     
     print(f"🚀 Iniciando procesamiento masivo de {total_pdfs} PDFs")
     
-    for i, pdf_key in enumerate(req.pdf_list):
+    for i, pdf_key in enumerate(req.pdf_key_list):
         folder_id = extract_folder_id_from_pdf_name(pdf_key)
         
         print(f"\n📄 Procesando PDF {i+1}/{total_pdfs}: {pdf_key}")
         print(f"📂 Folder ID extraído: {folder_id}")
         
+        filename = "".join(pdf_key.split("/")[-1].split(".")[:-1])
+        txt_filename = f"{filename}.txt"
         try:
             pdf_req = ProcessPDFRequest(
-                bucket=req.bucket,
-                pdf_key=pdf_key,
-                folder_id=folder_id
+                source_bucket=req.source_bucket,
+                source_pdf_key=pdf_key,
+                dest_bucket=req.dest_bucket,
+                dest_key=f"{req.dest_prefix}/{txt_filename}"
             )
             
             result = await process_single_pdf(pdf_req)
@@ -589,8 +601,10 @@ async def process_folder(req: ProcessFolderRequest):
         
         # Usar el endpoint de múltiples PDFs
         multiple_req = ProcessMultiplePDFsRequest(
-            bucket=req.bucket,
-            pdf_list=pdfs
+            source_bucket=req.bucket,
+            pdf_key_list=pdfs,
+            dest_bucket=req.dest_bucket,
+            dest_prefix=req.dest_prefix
         )
         
         return await process_multiple_pdfs(multiple_req)
